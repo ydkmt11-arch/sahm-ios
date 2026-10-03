@@ -24,10 +24,10 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>com.sahm.app.pair</string>
+			<string>io.github.ydkmt11arch.sahm.pair</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>sahm</string>
+				<string>ydsahm</string>
 			</array>
 		</dict>
 	</array>

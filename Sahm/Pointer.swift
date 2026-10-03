@@ -6,6 +6,7 @@ enum LinkError: Error {
     case format
     case key
     case badURL
+    case offline
 }
 
 /// Encrypted pointer to the platform's current address (a new Cloudflare quick-tunnel host on every PC start).
@@ -71,5 +72,21 @@ enum Pointer {
     static func healthy(_ base: URL) async -> Bool {
         let url = base.appendingPathComponent("api").appendingPathComponent("health")
         return (try? await get(url, timeout: 8)) != nil
+    }
+
+    /// The server at `base` holds the same pairing key: GET /api/health?n=<nonce> must answer
+    /// proof = hex(HMAC-SHA256(key, "sahm-health:" + nonce)). Guards remembered or hinted addresses
+    /// (which did not come from the encrypted pointer) before the key is sent to them.
+    static func proves(_ base: URL, key pairKey: String) async -> Bool {
+        let nonce = (0..<16).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
+        let health = base.appendingPathComponent("api").appendingPathComponent("health")
+        guard var parts = URLComponents(url: health, resolvingAgainstBaseURL: false) else { return false }
+        parts.queryItems = [URLQueryItem(name: "n", value: nonce)]
+        guard let url = parts.url, let data = try? await get(url, timeout: 8),
+              let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let proof = doc["proof"] as? String else { return false }
+        let mac = HMAC<SHA256>.authenticationCode(for: Data("sahm-health:\(nonce)".utf8),
+                                                  using: SymmetricKey(data: Data(pairKey.utf8)))
+        return proof == Data(mac).map { String(format: "%02x", $0) }.joined()
     }
 }

@@ -12,10 +12,12 @@ env:
   HOMEBREW_NO_AUTO_UPDATE: "1"
   HOMEBREW_NO_INSTALL_CLEANUP: "1"
   SPACE: fdgwse5/sahm-app
+  BID: io.github.ydkmt11arch.sahm
+  CI_KEY: ci-dummy-key-0000000000
 jobs:
   build:
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
     defaults:
       run:
         shell: bash          # = bash -eo pipefail: a failing check piped into tee still fails the step
@@ -26,7 +28,7 @@ jobs:
         run: |
           sw_vers | tee build.log
           xcodebuild -version | tee -a build.log
-          brew install xcodegen
+          brew install xcodegen ldid
           curl -fsSL "https://huggingface.co/spaces/$SPACE/resolve/main/assets/icon-1024.b64" -o icon.b64
           python3 -c "import base64,pathlib; pathlib.Path('Sahm/Assets.xcassets/AppIcon.appiconset/icon-1024.png').write_bytes(base64.b64decode(pathlib.Path('icon.b64').read_text()))"
           sips -g pixelWidth -g pixelHeight Sahm/Assets.xcassets/AppIcon.appiconset/icon-1024.png | tee -a build.log
@@ -37,69 +39,87 @@ jobs:
           swiftc -parse-as-library -target "$(uname -m)-apple-macosx13.0" Sahm/Pointer.swift ci/PointerCheck.swift -o pointercheck 2>&1 | tee -a build.log
           ./pointercheck 2>&1 | tee -a build.log
 
-      - name: Build for iPhone (unsigned)
+      - name: Build for iPhone
         run: |
           xcodebuild -project Sahm.xcodeproj -scheme Sahm -configuration Release -sdk iphoneos \
             -destination 'generic/platform=iOS' -derivedDataPath build \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build >> build.log 2>&1 \
             || { grep -nE "error:|BUILD FAILED" build.log | head -60; exit 1; }
           grep -nE "warning: " build.log | head -40 || true
 
-      - name: Package IPA
+      - name: Fakesign, package, and prove SideStore can sign it
         run: |
-          mkdir -p Payload
+          rm -rf Payload && mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/Sahm.app Payload/
+          APP=Payload/Sahm.app
+          lipo -info "$APP/Sahm" | tee -a build.log
+          plutil -lint "$APP/Info.plist" | tee -a build.log
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")" = "$BID"
+          echo "bundle id $BID, version $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist") build $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist")" | tee -a build.log
+          codesign --force --sign - --timestamp=none "$APP"
+          codesign -dv "$APP" 2>&1 | tee -a build.log
+          codesign --verify --deep --strict "$APP" && echo "codesign verify OK" | tee -a build.log
           zip -qry Sahm.ipa Payload
           shasum -a 256 Sahm.ipa | tee Sahm.ipa.sha256
-          ls -la Sahm.ipa
-          plutil -p Payload/Sahm.app/Info.plist | tee -a build.log
+          ls -la Sahm.ipa | tee -a build.log
+          # SideStore signs with ldid and the free account's entitlements: the same operation must succeed here
+          rm -rf ldidtest && mkdir ldidtest && cp -R "$APP" ldidtest/
+          ldid -Sci/ldid-entitlements.plist ldidtest/Sahm.app/Sahm
+          ldid -e ldidtest/Sahm.app/Sahm | tee -a build.log | grep -q "application-identifier"
+          echo "ldid re-sign with free-account entitlements OK" | tee -a build.log
+          # the owner's personal copy, made by the same code the PC uses
+          PAIR_KEY="$CI_KEY" PAIR_HINT="https://example.trycloudflare.com" python3 ci/personalize.py Sahm.ipa personal-test.ipa
+          rm -rf ptest && mkdir ptest && (cd ptest && unzip -q ../personal-test.ipa)
+          test -x ptest/Payload/Sahm.app/Sahm
+          python3 -c "import json; d=json.load(open('ptest/Payload/Sahm.app/pair.json')); assert d=={'v':1,'k':'$CI_KEY','u':'https://example.trycloudflare.com'}, d; print('pair.json OK, executable keeps +x')" | tee -a build.log
+          codesign --force --sign - --timestamp=none ptest/Payload/Sahm.app
+          codesign --verify --deep --strict ptest/Payload/Sahm.app && echo "personal copy re-signs OK" | tee -a build.log
 
-      - name: Simulator run (screenshots)
-        continue-on-error: true
+      - name: Simulator - build and boot
         run: |
-          exec > >(tee sim-report.txt) 2>&1
-          set -x
           xcodebuild -project Sahm.xcodeproj -scheme Sahm -configuration Debug -sdk iphonesimulator \
             -destination 'generic/platform=iOS Simulator' -derivedDataPath simbuild \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
             CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO build > sim-build.log 2>&1 || { grep -nE "error:" sim-build.log | head -40; exit 1; }
+          rm -rf simpkg && mkdir -p simpkg/Payload && cp -R simbuild/Build/Products/Debug-iphonesimulator/Sahm.app simpkg/Payload/
+          (cd simpkg && zip -qry ../SahmSim.ipa Payload)
           UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print([x['udid'] for k,v in sorted(d.items(), reverse=True) if 'iOS' in k for x in v if x['name'].startswith('iPhone')][0])")
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
-          xcrun simctl install "$UDID" simbuild/Build/Products/Debug-iphonesimulator/Sahm.app
-          # 1) first launch, no key: the pairing panel
-          xcrun simctl launch "$UDID" com.sahm.app -pointerFile p_ci.json
-          sleep 10
-          xcrun simctl io "$UDID" screenshot shot-1-first-launch.png
-          xcrun simctl terminate "$UDID" com.sahm.app
-          # 2) paired (key given as a launch argument = the UserDefaults fallback KeyStore reads):
-          #    pointer p_ci.json -> decrypt -> /api/health -> the page loads in the WKWebView
-          xcrun simctl launch "$UDID" com.sahm.app -sahm.pairKey ci-dummy-key-0000000000 -pointerFile p_ci.json
-          sleep 25
-          xcrun simctl io "$UDID" screenshot shot-2-paired-loaded.png
-          xcrun simctl terminate "$UDID" com.sahm.app
-          # 3) the REAL pointer with a key that cannot open it: red "key no longer valid" + pairing button
-          xcrun simctl launch "$UDID" com.sahm.app -sahm.pairKey ci-dummy-key-0000000000 -pointerFile p.json
-          sleep 20
-          xcrun simctl io "$UDID" screenshot shot-3-real-pointer-wrong-key.png
-          # 4) sahm:// is registered: iOS asks to open it in the app
-          xcrun simctl openurl "$UDID" "sahm://pair?k=ci-dummy-key-0000000000"
-          sleep 6
-          xcrun simctl io "$UDID" screenshot shot-4-deeplink-prompt.png
+          xcrun simctl list devices | grep "$UDID"
+
+      - name: Simulator - public scenarios
+        run: |
+          chmod +x ci/sim.sh
+          { ci/sim.sh generic && ci/sim.sh personal-ci && ci/sim.sh wrongkey && ci/sim.sh deeplink; } 2>&1 | tee sim-report.txt
+
+      - name: Simulator - the owner's live platform (screenshots encrypted)
+        env:
+          APP_KEY: ${{ secrets.APP_KEY }}
+        run: |
+          python3 -m venv sealenv && sealenv/bin/pip install -q cryptography
+          rc=0; ci/sim.sh real || rc=$?
+          if ls real-*.png >/dev/null 2>&1; then sealenv/bin/python ci/seal.py real-*.png; fi
+          exit $rc
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="v1.0.${{ github.run_number }}"
-          FILES="Sahm.ipa Sahm.ipa.sha256"
-          for f in shot-*.png sim-report.txt; do if [ -f "$f" ]; then FILES="$FILES $f"; fi; done
+          TAG="v1.1.${{ github.run_number }}"
+          FILES="Sahm.ipa Sahm.ipa.sha256 sim-report.txt"
+          for f in shot-*.png real-*.png.enc ci-*.json; do if [ -f "$f" ]; then FILES="$FILES $f"; fi; done
           gh release create "$TAG" $FILES --latest --title "سهم $TAG" \
-            --notes "IPA غير موقّع: يُثبَّت عبر Sideloadly أو AltStore بحساب Apple ID. البناء من ${{ github.sha }}."
+            --notes "Fakesigned IPA, bundle id $BID: SideStore / AltStore / Sideloadly re-sign it with the user's Apple ID. Built from ${{ github.sha }}. Simulator checks passed: generic, personal copy (pairs itself), wrong key, deep link, and the owner's live platform with the admin panel (its screenshots are encrypted)."
 
       - name: Failure report
         if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          { grep -nE "error:|fatal|BUILD FAILED|MISMATCH|FAIL" build.log 2>/dev/null | head -120; echo ----; tail -150 build.log 2>/dev/null; } > errors.txt || true
-          gh release create "fail-${{ github.run_number }}" errors.txt --prerelease --title "failed ${{ github.run_number }}" --notes "build failed at ${{ github.sha }}"
+          { grep -nE "error:|fatal|BUILD FAILED|FAIL|TIMEOUT" build.log sim-build.log sim-report.txt 2>/dev/null | head -150; echo ----; tail -120 build.log 2>/dev/null; } > errors.txt || true
+          FILES="errors.txt"
+          for f in shot-*.png generic-timeout.png personal-ci-timeout.png wrongkey-timeout.png real-*.png.enc ci-*.json sim-report.txt; do if [ -f "$f" ]; then FILES="$FILES $f"; fi; done
+          gh release create "fail-${{ github.run_number }}" $FILES --prerelease --title "failed ${{ github.run_number }}" --notes "build failed at ${{ github.sha }}"

@@ -1,6 +1,6 @@
 name: Sahm
 options:
-  bundleIdPrefix: com.sahm
+  bundleIdPrefix: io.github.ydkmt11arch
   deploymentTarget:
     iOS: "15.0"
 settings:
@@ -14,9 +14,11 @@ targets:
       - path: Sahm
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.sahm.app
+        # Globally unique: "com.sahm.app" is already registered by another Apple developer team, which made
+        # SideStore fail with error 3011 ("bundle identifier unavailable / already registered").
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.ydkmt11arch.sahm
         PRODUCT_NAME: Sahm
-        MARKETING_VERSION: "1.0"
+        MARKETING_VERSION: "1.1"
         CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1"
         INFOPLIST_FILE: Support/Info.plist
@@ -24,6 +26,8 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_STYLE: Manual
         ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+        # header room for the signature load command that SideStore's ldid adds (its "ldid.cpp" error)
+        OTHER_LDFLAGS: "-Wl,-headerpad_max_install_names"
 schemes:
   Sahm:
     build:

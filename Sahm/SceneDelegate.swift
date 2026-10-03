@@ -13,7 +13,7 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         window.rootViewController = root
         window.makeKeyAndVisible()
         self.window = window
-        if let url = connectionOptions.urlContexts.first?.url {      // cold start from sahm://pair
+        if let url = connectionOptions.urlContexts.first?.url {      // cold start from ydsahm://pair
             root.handle(url: url)
         }
     }
@@ -24,7 +24,11 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         }
     }
 
-    func sceneWillEnterForeground(_ scene: UIScene) {
-        root.refreshIfStale()
+    func sceneDidBecomeActive(_ scene: UIScene) {
+        root.resume()
+    }
+
+    func sceneDidEnterBackground(_ scene: UIScene) {
+        root.pause()
     }
 }
