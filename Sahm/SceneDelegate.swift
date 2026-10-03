@@ -24,6 +24,10 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         }
     }
 
+    func sceneWillEnterForeground(_ scene: UIScene) {
+        root.willForeground()
+    }
+
     func sceneDidBecomeActive(_ scene: UIScene) {
         root.resume()
     }

@@ -1,12 +1,14 @@
 import UIKit
 import WebKit
 
-/// One screen: the platform — the same mini app the owner opens in Telegram — in a WKWebView, with a native
-/// panel on top for pairing, connecting and errors.
+/// One screen. The interface — the same files as the Telegram mini app — runs from inside the app (sahmui://app/),
+/// so it opens at once, keeps the last data when the PC is off, and updates itself from the PC without reinstalling
+/// (WebBundle + UIUpdater). Native panels cover it only for pairing, the very first download, and the optional lock.
 final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     private enum Screen { case busy, pairing, offline, web }
 
     private var web: WKWebView!
+    private let scheme = AppScheme()
     private let panel = UIView()
     private let stack = UIStackView()
     private let spinner = UIActivityIndicatorView(style: .large)
@@ -17,9 +19,9 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
     private let secondaryButton = UIButton(type: .system)
     private var primaryAction: (() -> Void)?
     private var secondaryAction: (() -> Void)?
+    private let lockCover = UIView()
 
     private var screen: Screen = .busy
-    private var base: URL?
     private var hint: URL?
     private var hasBundledKey = false
     private var resolvedAt = Date.distantPast
@@ -27,7 +29,22 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
     private var watchdog: Timer?
     private var misses = 0
     private var checking = false
-    private var ciStarted = false
+    private var locating = false
+    private var lastLocate = Date.distantPast
+
+    private var loaded: WebBundle.Root?
+    private var pageReady = false
+    private var readyTimer: Timer?
+    private var justUpdated = false
+
+    private var locked = false
+    private var authenticating = false
+    private var promptedThisVisit = false
+    private var backgroundAt: Date?
+
+    private var ciReports = 0
+    private var ciFirstDone = false
+    private var ciPending: WebBundle.Root?
 
     private static let lastURLKey = "sahm.lastURL"
 
@@ -40,8 +57,12 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = Theme.ground
+        scheme.forceOffline = UserDefaults.standard.bool(forKey: "ciForceOffline")
+        Link.shared.onUnreachable = { [weak self] in self?.unreachable() }
         buildWeb()
         buildPanel()
+        buildLockCover()
+        if LockGate.shared.enabled { lockNow() }
         start()
     }
 
@@ -51,10 +72,46 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         let bundled = Bundled.applyIfNew()
         hasBundledKey = bundled != nil
         hint = bundled?.hint
-        if let key = KeyStore.read() {
-            connect(key)
-        } else {
+        guard let key = KeyStore.read() else {
+            Link.shared.key = nil
             showPairing(problem: nil)
+            return
+        }
+        Link.shared.key = key
+        if loaded == nil { showInterface() }
+        if !scheme.forceOffline { connect(key) }
+    }
+
+    /// The newest copy of the interface on the phone, at once (its data comes from the phone's copy until the PC answers).
+    private func showInterface() {
+        if let root = WebBundle.best() {
+            load(root)
+        } else {
+            showBusy("جاري تجهيز سهم لأول مرة…")      // no copy yet: it downloads as soon as the PC answers
+        }
+    }
+
+    private func load(_ root: WebBundle.Root, updated: Bool = false) {
+        loaded = root
+        scheme.root = root.dir
+        pageReady = false
+        justUpdated = updated
+        installBridge()
+        web.load(URLRequest(url: AppScheme.home))
+        readyTimer?.invalidate()
+        readyTimer = Timer.scheduledTimer(withTimeInterval: 25, repeats: false) { [weak self] _ in
+            self?.readyTimedOut()
+        }
+    }
+
+    /// The page never reported that it started: use another copy if there is one (this version is never tried again).
+    private func readyTimedOut() {
+        guard !pageReady, let current = loaded else { return }
+        if let other = WebBundle.best(excluding: [current.manifest.version]) {
+            WebBundle.markBad(current.manifest.version)
+            load(other)
+        } else {
+            hidePanel()
         }
     }
 
@@ -67,30 +124,58 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
                   .queryItems?.first(where: { $0.name == "k" })?.value,
               PairKey.isValid(key) else { return false }
         KeyStore.save(key)
-        connect(key)
+        screen = .busy
+        start()
         return true
     }
 
-    /// The scene became active: check the address now, then every 45 s while the app is in front.
+    /// The scene became active: unlock if needed, check the address, and look for a newer interface.
     func resume() {
+        if locked && !authenticating && !promptedThisVisit { promptUnlock() }
         refreshIfStale()
         watchdog?.invalidate()
         watchdog = Timer.scheduledTimer(timeInterval: 45, target: self, selector: #selector(tickTimer),
                                         userInfo: nil, repeats: true)
+        if Link.shared.base != nil { update(force: false, manual: false) }      // at most every 10 minutes
     }
 
+    /// The app went to the background: hide its content from the app switcher when the lock is on.
     func pause() {
         watchdog?.invalidate()
         watchdog = nil
+        backgroundAt = Date()
+        promptedThisVisit = false
+        if LockGate.shared.enabled {
+            lockCover.isHidden = false
+            view.bringSubviewToFront(lockCover)
+        }
     }
 
-    /// Back after 5+ minutes away: the PC may have restarted with a new address.
+    /// Back from the background: after more than a minute away the lock asks again.
+    func willForeground() {
+        guard LockGate.shared.enabled else {
+            lockCover.isHidden = true
+            return
+        }
+        let away = Date().timeIntervalSince(backgroundAt ?? .distantPast)
+        if away > 60 {
+            locked = true
+        } else if !locked {
+            lockCover.isHidden = true
+        }
+    }
+
+    /// Back after 5+ minutes: the PC may have restarted with a new address.
     func refreshIfStale() {
-        guard screen == .web, let current = base, let key = KeyStore.read(),
-              Date().timeIntervalSince(resolvedAt) > 300 else { return }
+        guard let key = Link.shared.key, !scheme.forceOffline, Date().timeIntervalSince(resolvedAt) > 300 else { return }
+        guard let current = Link.shared.base else {
+            if !locating { connect(key) }
+            return
+        }
         Task { @MainActor in
             if await Pointer.healthy(current) {
                 self.resolvedAt = Date()
+                self.notifyPage("sahm:online")
             } else {
                 self.connect(key)
             }
@@ -101,66 +186,92 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         tick()
     }
 
-    /// While the page is shown: two failed health checks in a row -> look for a new address and move to it.
-    /// While the offline panel is shown: retry quietly, so the app comes back by itself when the PC does.
+    /// Every 45 s in front: two failed health checks in a row -> look for a new address. Not found yet -> try again,
+    /// so the app comes back by itself when the PC does.
     private func tick() {
-        guard !checking, let key = KeyStore.read() else { return }
-        switch screen {
-        case .web:
-            guard let current = base else { return }
-            checking = true
-            let file = pointerFile
-            Task { @MainActor in
-                defer { self.checking = false }
-                if await Pointer.healthy(current) {
-                    self.misses = 0
-                    self.resolvedAt = Date()
-                    return
-                }
-                self.misses += 1
-                guard self.misses >= 2 else { return }
-                self.misses = 0
-                guard let fresh = try? await Pointer.fetch(pairKey: key, file: file), fresh != current,
-                      await Pointer.healthy(fresh) else { return }
-                self.use(fresh, key: key)
-            }
-        case .offline:
-            checking = true
-            let gen = generation
-            Task { @MainActor in
-                defer { self.checking = false }
-                guard let url = try? await self.locate(key: key), gen == self.generation,
-                      self.screen == .offline else { return }
-                self.use(url, key: key)
-            }
-        case .busy, .pairing:
+        guard !checking, !scheme.forceOffline, let key = Link.shared.key else { return }
+        guard let current = Link.shared.base else {
+            if !locating { connect(key) }
             return
+        }
+        checking = true
+        let file = pointerFile
+        Task { @MainActor in
+            defer { self.checking = false }
+            if await Pointer.healthy(current) {
+                self.misses = 0
+                self.resolvedAt = Date()
+                Link.shared.markUp()
+                return
+            }
+            self.misses += 1
+            guard self.misses >= 2 else { return }
+            self.misses = 0
+            if let fresh = try? await Pointer.fetch(pairKey: key, file: file), fresh != current,
+               await Pointer.healthy(fresh) {
+                self.online(fresh)
+            } else {
+                self.notifyPage("sahm:offline")
+            }
         }
     }
 
     private func connect(_ key: String) {
         generation += 1
         let gen = generation
-        showBusy("جاري الاتصال بالمنصة…")
+        locating = true
+        lastLocate = Date()
         Task { @MainActor in
+            defer {
+                if gen == self.generation { self.locating = false }
+            }
             do {
                 let url = try await self.locate(key: key)
                 guard gen == self.generation else { return }
-                self.use(url, key: key)
+                self.online(url)
             } catch LinkError.key {
                 guard gen == self.generation else { return }
                 self.showPairing(problem: "رمز الربط لم يعد صالحًا — ثبّت نسختك الجديدة من لوحة الإدارة أو الصق الرمز الجديد.")
             } catch {
                 guard gen == self.generation else { return }
-                self.showOffline(reason: Self.describe(error))
+                self.unreachableNow(MainViewController.describe(error))
             }
+        }
+    }
+
+    /// The proxy could not reach the address (the PC may have restarted): look for a new one, at most every 30 s.
+    private func unreachable() {
+        guard !locating, !scheme.forceOffline, let key = Link.shared.key,
+              Date().timeIntervalSince(lastLocate) > 30 else { return }
+        connect(key)
+    }
+
+    private func online(_ url: URL) {
+        Link.shared.base = url
+        resolvedAt = Date()
+        misses = 0
+        if isRealPointer {
+            UserDefaults.standard.set(url.absoluteString, forKey: MainViewController.lastURLKey)
+        }
+        if loaded == nil && screen == .offline { showBusy("جاري تجهيز سهم لأول مرة…") }
+        notifyPage("sahm:online")
+        update(force: loaded == nil, manual: false)
+    }
+
+    /// The PC is not answering. With the interface on screen it shows the last data with its own banner;
+    /// without one (the very first run) the native panel explains.
+    private func unreachableNow(_ reason: String) {
+        if loaded != nil {
+            notifyPage("sahm:offline")
+        } else {
+            showOffline(reason: reason)
         }
     }
 
     /// The fastest live address: the last one that worked, else the encrypted pointer, else the address built into
     /// this IPA. Addresses that did not come from the pointer must first prove they hold the key.
     private func locate(key: String) async throws -> URL {
-        if isRealPointer, let text = UserDefaults.standard.string(forKey: Self.lastURLKey),
+        if isRealPointer, let text = UserDefaults.standard.string(forKey: MainViewController.lastURLKey),
            let last = URL(string: text), await Pointer.proves(last, key: key) {
             return last
         }
@@ -179,29 +290,29 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         throw failure
     }
 
-    private func use(_ url: URL, key: String) {
-        base = url
-        resolvedAt = Date()
-        misses = 0
-        if isRealPointer {
-            UserDefaults.standard.set(url.absoluteString, forKey: Self.lastURLKey)
+    /// Newer interface on the PC -> download only what changed -> switch to it. `manual` = asked from the page.
+    private func update(force: Bool, manual: Bool) {
+        Task { @MainActor in
+            if manual { self.notifyPage("sahm:update", ["state": "checking"]) }
+            let outcome = await UIUpdater.shared.check(current: self.loaded?.manifest.version, force: force || manual)
+            switch outcome {
+            case .installed(let root):
+                let replacing = self.loaded != nil     // the very first download is not an "update"
+                if self.ciEnabled && !self.ciFirstDone && replacing {
+                    self.ciPending = root           // CI: report the first page before switching to the update
+                } else {
+                    self.load(root, updated: replacing)
+                }
+            case .upToDate:
+                if manual { self.notifyPage("sahm:update", ["state": "current"]) }
+                if self.loaded == nil { self.showOffline(reason: "لا توجد نسخة صالحة من الواجهة.") }
+            case .failed(let why):
+                if manual { self.notifyPage("sahm:update", ["state": "failed", "detail": why]) }
+                if self.loaded == nil { self.showOffline(reason: "تعذّر تنزيل الواجهة من الكمبيوتر.") }
+            case .skipped:
+                if manual { self.notifyPage("sahm:update", ["state": "busy"]) }
+            }
         }
-        load(url, key: key)
-    }
-
-    private func load(_ base: URL, key: String) {
-        guard var parts = URLComponents(url: base, resolvingAgainstBaseURL: false) else {
-            showOffline(reason: "عنوان المنصة غير صالح.")
-            return
-        }
-        parts.path = "/"
-        parts.queryItems = [URLQueryItem(name: "key", value: key)]
-        guard let url = parts.url else {
-            showOffline(reason: "عنوان المنصة غير صالح.")
-            return
-        }
-        showBusy("جاري فتح سهم…")
-        web.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30))
     }
 
     private func pasteKey() {
@@ -218,7 +329,8 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
             return
         }
         KeyStore.save(key)
-        connect(key)
+        screen = .busy
+        start()
     }
 
     private func unpair() {
@@ -228,8 +340,10 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         alert.addAction(UIAlertAction(title: "تراجع", style: .cancel))
         alert.addAction(UIAlertAction(title: "إلغاء الربط", style: .destructive) { [weak self] _ in
             KeyStore.clear()
-            UserDefaults.standard.removeObject(forKey: Self.lastURLKey)
-            self?.base = nil
+            ApiCache.clear()
+            UserDefaults.standard.removeObject(forKey: MainViewController.lastURLKey)
+            Link.shared.key = nil
+            Link.shared.base = nil
             self?.generation += 1
             self?.showPairing(problem: nil)
         })
@@ -237,20 +351,10 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
     }
 
     @objc private func pulled() {
-        guard let key = KeyStore.read() else {
-            web.scrollView.refreshControl?.endRefreshing()
-            return
-        }
-        guard let current = base else {
-            connect(key)
-            return
-        }
-        Task { @MainActor in
-            if await Pointer.healthy(current) {
-                self.web.reload()
-            } else {
-                self.connect(key)
-            }
+        notifyPage("sahm:refresh")
+        if Link.shared.base == nil, let key = Link.shared.key, !locating, !scheme.forceOffline { connect(key) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            self?.web.scrollView.refreshControl?.endRefreshing()
         }
     }
 
@@ -275,6 +379,61 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
             return "خطأ في الشبكة (\(url.code.rawValue))."
         }
         return "خطأ غير متوقع."
+    }
+
+    // MARK: - Lock
+
+    private func lockNow() {
+        locked = true
+        lockCover.isHidden = false
+        view.bringSubviewToFront(lockCover)
+    }
+
+    private func promptUnlock() {
+        guard locked, !authenticating else { return }
+        if LockGate.shared.kind == "none" {             // the passcode was removed from the phone: nothing to ask
+            LockGate.shared.enabled = false
+            unlockDone()
+            return
+        }
+        authenticating = true
+        promptedThisVisit = true
+        LockGate.shared.authenticate(reason: "افتح سهم") { [weak self] ok in
+            guard let self = self else { return }
+            self.authenticating = false
+            if ok { self.unlockDone() }
+        }
+    }
+
+    private func unlockDone() {
+        locked = false
+        UIView.animate(withDuration: 0.2, animations: { self.lockCover.alpha = 0 }, completion: { _ in
+            self.lockCover.isHidden = true
+            self.lockCover.alpha = 1
+        })
+    }
+
+    private func setLock(_ on: Bool) {
+        if !on {
+            LockGate.shared.enabled = false
+            notifyPage("sahm:lock", ["enabled": false, "ok": true])
+            return
+        }
+        guard LockGate.shared.kind != "none" else {
+            notifyPage("sahm:lock", ["enabled": false, "ok": false, "detail": "فعّل رمز المرور في الجوال أولًا."])
+            return
+        }
+        authenticating = true
+        LockGate.shared.authenticate(reason: "تفعيل قفل سهم") { [weak self] ok in
+            guard let self = self else { return }
+            self.authenticating = false
+            if ok { LockGate.shared.enabled = true }
+            self.notifyPage("sahm:lock", ["enabled": LockGate.shared.enabled, "ok": ok])
+        }
+    }
+
+    @objc private func tapUnlock() {
+        promptUnlock()
     }
 
     // MARK: - Panel states
@@ -331,12 +490,18 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         panel.layer.removeAllAnimations()
         panel.alpha = 1
         panel.isHidden = false
+        view.bringSubviewToFront(panel)
+        if !lockCover.isHidden { view.bringSubviewToFront(lockCover) }
         if !busy {
             ciWrite(["stage": "panel", "title": title ?? "", "body": body ?? "", "detail": detail ?? ""])
         }
     }
 
     private func hidePanel() {
+        guard screen != .pairing, !panel.isHidden else {
+            if screen != .pairing { screen = .web }
+            return
+        }
         screen = .web
         UIView.animate(withDuration: 0.25, animations: { self.panel.alpha = 0 }, completion: { _ in
             if self.panel.alpha == 0 {
@@ -349,23 +514,103 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
     @objc private func tapPrimary() { primaryAction?() }
     @objc private func tapSecondary() { secondaryAction?() }
 
+    // MARK: - Page bridge
+
+    /// window.SahmApp: what the page knows about the app, and what it can ask of it.
+    private func installBridge() {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let manifest = loaded?.manifest
+        let ui: [String: Any] = ["version": String((manifest?.version ?? "").prefix(12)),
+                                 "builtAt": manifest?.builtAt ?? "",
+                                 "builtIn": loaded?.builtIn ?? false,
+                                 "updated": justUpdated]
+        let lock: [String: Any] = ["kind": LockGate.shared.kind, "enabled": LockGate.shared.enabled]
+        var payload: [String: Any] = ["platform": "ios"]
+        payload["version"] = info["CFBundleShortVersionString"] as? String ?? "?"
+        payload["build"] = info["CFBundleVersion"] as? String ?? "?"
+        payload["ui"] = ui
+        payload["lock"] = lock
+        let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data("{}".utf8)
+        let json = String(data: data, encoding: .utf8) ?? "{}"
+        let source = """
+        (function () {
+          var info = \(json);
+          function post(m) { try { window.webkit.messageHandlers.sahm.postMessage(m); } catch (e) {} }
+          info.haptic = function (kind) { post({ haptic: String(kind || "medium") }); };
+          info.ready = function () { post({ ready: true }); };
+          info.setLock = function (on) { post({ lock: !!on }); };
+          info.checkUpdate = function () { post({ checkUpdate: true }); };
+          info.openExternal = function (url) { post({ open: String(url) }); };
+          info.share = function (text, url) { post({ share: { text: String(text || ""), url: String(url || "") } }); };
+          window.SahmApp = Object.freeze(info);
+        })();
+        """
+        let controller = web.configuration.userContentController
+        controller.removeAllUserScripts()
+        controller.addUserScript(WKUserScript(source: source, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+    }
+
+    private func notifyPage(_ name: String, _ detail: [String: Any] = [:]) {
+        guard loaded != nil else { return }
+        let data = (try? JSONSerialization.data(withJSONObject: detail)) ?? Data("{}".utf8)
+        let json = String(data: data, encoding: .utf8) ?? "{}"
+        web.evaluateJavaScript("window.dispatchEvent(new CustomEvent('\(name)', { detail: \(json) }))",
+                               completionHandler: nil)
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let body = message.body as? [String: Any] else { return }
+        if let kind = body["haptic"] as? String { haptic(kind) }
+        if body["ready"] != nil { pageStarted() }
+        if let on = body["lock"] as? Bool { setLock(on) }
+        if body["checkUpdate"] != nil { update(force: true, manual: true) }
+        if let text = body["open"] as? String, let url = URL(string: text),
+           ["https", "http"].contains(url.scheme?.lowercased() ?? "") {
+            UIApplication.shared.open(url)
+        }
+        if let item = body["share"] as? [String: Any] { share(item) }
+    }
+
+    private func pageStarted() {
+        guard !pageReady else { return }
+        pageReady = true
+        readyTimer?.invalidate()
+        hidePanel()
+        ciStage()
+    }
+
+    private func haptic(_ kind: String) {
+        switch kind {
+        case "success": UINotificationFeedbackGenerator().notificationOccurred(.success)
+        case "warning": UINotificationFeedbackGenerator().notificationOccurred(.warning)
+        case "error": UINotificationFeedbackGenerator().notificationOccurred(.error)
+        case "light": UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        case "heavy": UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+        case "select": UISelectionFeedbackGenerator().selectionChanged()
+        default: UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        }
+    }
+
+    private func share(_ item: [String: Any]) {
+        var items: [Any] = []
+        if let text = item["text"] as? String, !text.isEmpty { items.append(text) }
+        if let link = item["url"] as? String, let url = URL(string: link), url.scheme == "https" { items.append(url) }
+        guard !items.isEmpty, presentedViewController == nil else { return }
+        let sheet = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        sheet.popoverPresentationController?.sourceView = view
+        present(sheet, animated: true)
+    }
+
     // MARK: - Views
 
     private func buildWeb() {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
+        config.setURLSchemeHandler(scheme, forURLScheme: AppScheme.name)
         let info = Bundle.main.infoDictionary ?? [:]
         let version = info["CFBundleShortVersionString"] as? String ?? "?"
-        let build = info["CFBundleVersion"] as? String ?? "?"
         config.applicationNameForUserAgent = "SahmApp/\(version)"
         config.allowsInlineMediaPlayback = true
-        // window.SahmApp tells the page it runs inside this app (native haptics, no Telegram chrome)
-        let bridge = """
-        window.SahmApp = Object.freeze({ platform: "ios", version: "\(version)", build: "\(build)",
-          haptic: function (kind) { try { window.webkit.messageHandlers.sahm.postMessage({ haptic: String(kind || "medium") }); } catch (e) {} } });
-        """
-        config.userContentController.addUserScript(WKUserScript(source: bridge, injectionTime: .atDocumentStart,
-                                                                forMainFrameOnly: true))
         // retained by the content controller: fine, this controller is the app's root for its whole life
         config.userContentController.add(self, name: "sahm")
         let webView = WKWebView(frame: .zero, configuration: config)
@@ -375,16 +620,10 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         webView.isOpaque = false
         webView.backgroundColor = Theme.ground
         webView.scrollView.backgroundColor = Theme.ground
-        webView.scrollView.contentInsetAdjustmentBehavior = .never
+        webView.scrollView.contentInsetAdjustmentBehavior = .never     // the page lays out its own safe areas
         webView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(webView)
-        let guide = view.safeAreaLayoutGuide
-        NSLayoutConstraint.activate([
-            webView.topAnchor.constraint(equalTo: guide.topAnchor),
-            webView.bottomAnchor.constraint(equalTo: guide.bottomAnchor),
-            webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-        ])
+        pin(webView)
         let refresh = UIRefreshControl()
         refresh.tintColor = Theme.sand
         refresh.addTarget(self, action: #selector(pulled), for: .valueChanged)
@@ -392,17 +631,21 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         web = webView
     }
 
+    private func pin(_ child: UIView) {
+        NSLayoutConstraint.activate([
+            child.topAnchor.constraint(equalTo: view.topAnchor),
+            child.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            child.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            child.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+        ])
+    }
+
     private func buildPanel() {
         panel.backgroundColor = Theme.ground
         panel.translatesAutoresizingMaskIntoConstraints = false
         panel.semanticContentAttribute = .forceRightToLeft
         view.addSubview(panel)
-        NSLayoutConstraint.activate([
-            panel.topAnchor.constraint(equalTo: view.topAnchor),
-            panel.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            panel.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            panel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-        ])
+        pin(panel)
 
         let logo = UILabel()
         logo.text = "سهم"
@@ -445,6 +688,40 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         ])
     }
 
+    private func buildLockCover() {
+        lockCover.backgroundColor = Theme.ground
+        lockCover.isHidden = true
+        lockCover.translatesAutoresizingMaskIntoConstraints = false
+        lockCover.semanticContentAttribute = .forceRightToLeft
+        view.addSubview(lockCover)
+        pin(lockCover)
+        let icon = UIImageView(image: UIImage(systemName: "lock.fill"))
+        icon.tintColor = Theme.muted
+        icon.contentMode = .scaleAspectFit
+        let logo = UILabel()
+        logo.text = "سهم"
+        logo.font = .systemFont(ofSize: 46, weight: .heavy)
+        logo.textColor = Theme.sand
+        logo.textAlignment = .center
+        let button = UIButton(type: .system)
+        style(button, filled: true)
+        button.setTitle("افتح سهم", for: .normal)
+        button.addTarget(self, action: #selector(tapUnlock), for: .touchUpInside)
+        let column = UIStackView(arrangedSubviews: [icon, logo, button])
+        column.axis = .vertical
+        column.spacing = 18
+        column.alignment = .fill
+        column.translatesAutoresizingMaskIntoConstraints = false
+        lockCover.addSubview(column)
+        let guide = lockCover.safeAreaLayoutGuide
+        NSLayoutConstraint.activate([
+            icon.heightAnchor.constraint(equalToConstant: 34),
+            column.centerYAnchor.constraint(equalTo: guide.centerYAnchor),
+            column.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 40),
+            column.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -40),
+        ])
+    }
+
     private func style(_ button: UIButton, filled: Bool) {
         button.titleLabel?.font = .systemFont(ofSize: 17, weight: .semibold)
         button.layer.cornerRadius = 14
@@ -462,20 +739,6 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         }
     }
 
-    // MARK: - Native bridge (haptics from the page)
-
-    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard let body = message.body as? [String: Any], let kind = body["haptic"] as? String else { return }
-        switch kind {
-        case "success": UINotificationFeedbackGenerator().notificationOccurred(.success)
-        case "warning": UINotificationFeedbackGenerator().notificationOccurred(.warning)
-        case "error": UINotificationFeedbackGenerator().notificationOccurred(.error)
-        case "light": UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        case "heavy": UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
-        default: UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        }
-    }
-
     // MARK: - WKNavigationDelegate
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
@@ -484,8 +747,8 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
             decisionHandler(.cancel)
             return
         }
-        let scheme = url.scheme?.lowercased() ?? ""
-        if ["about", "data", "blob"].contains(scheme) || (url.host != nil && url.host == base?.host) {
+        let kind = url.scheme?.lowercased() ?? ""
+        if kind == AppScheme.name || ["about", "data", "blob"].contains(kind) {
             decisionHandler(.allow)
             return
         }
@@ -500,7 +763,11 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         web.scrollView.refreshControl?.endRefreshing()
         hidePanel()
-        ciPageLoaded()
+        // an interface that never calls SahmApp.ready(): the CI report still runs
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self = self, !self.pageReady else { return }
+            self.ciStage()
+        }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
@@ -521,14 +788,19 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         let ns = error as NSError
         if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled { return }
         if ns.domain == "WebKitErrorDomain" && ns.code == 102 { return }   // our own cancel of an outside link
-        showOffline(reason: "تعذّر فتح المنصة (\(ns.code)).")
+        if let current = loaded, let other = WebBundle.best(excluding: [current.manifest.version]) {
+            WebBundle.markBad(current.manifest.version)
+            load(other)
+            return
+        }
+        showOffline(reason: "تعذّر فتح الواجهة (\(ns.code)).")
     }
 
     // MARK: - WKUIDelegate
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        if let url = navigationAction.request.url {
+        if let url = navigationAction.request.url, url.scheme?.lowercased() != AppScheme.name {
             UIApplication.shared.open(url)
         }
         return nil
@@ -582,16 +854,30 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         try? data.write(to: dir.appendingPathComponent("ci.json"), options: .atomic)
     }
 
-    private func ciPageLoaded() {
-        guard ciEnabled, !ciStarted else { return }
-        ciStarted = true
+    /// One report per page start: "home" (or -ciStage) for the first, "updated" after an interface update.
+    private func ciStage() {
+        guard ciEnabled else { return }
+        ciReports += 1
+        let first = ciReports == 1
+        let stage = justUpdated ? "updated" : (UserDefaults.standard.string(forKey: "ciStage") ?? "home")
         DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
-            self?.ciProbe(stage: "home") { self?.ciAwaitNext(attempt: 0) }
+            self?.ciProbe(stage: stage) {
+                guard let self = self else { return }
+                if !self.ciFirstDone {
+                    self.ciFirstDone = true
+                    if let pending = self.ciPending {
+                        self.ciPending = nil
+                        self.load(pending, updated: true)
+                        return
+                    }
+                }
+                if first && stage == "home" { self.ciAwaitNext(attempt: 0) }
+            }
         }
     }
 
     private func ciProbe(stage: String, then next: (() -> Void)? = nil) {
-        web.evaluateJavaScript(Self.probeJS) { [weak self] result, error in
+        web.evaluateJavaScript(MainViewController.probeJS) { [weak self] result, error in
             var report: [String: Any] = ["stage": stage]
             if let text = result as? String, let data = text.data(using: .utf8),
                let probe = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -608,7 +894,7 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
     private func ciAwaitNext(attempt: Int) {
         guard UserDefaults.standard.bool(forKey: "ciAdmin"), attempt < 240, let dir = documents else { return }
         if FileManager.default.fileExists(atPath: dir.appendingPathComponent("ci-next").path) {
-            web.evaluateJavaScript(Self.longPressJS) { [weak self] _, _ in
+            web.evaluateJavaScript(MainViewController.longPressJS) { [weak self] _, _ in
                 DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
                     self?.ciProbe(stage: "admin")
                 }
@@ -626,11 +912,20 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
       const sheet = document.querySelector("#admin-sheet");
       const adm = document.querySelector("#admin-body");
       const at = adm ? adm.innerText : "";
+      const app = window.SahmApp || {};
+      const ui = app.ui || {};
+      const off = document.querySelector("#offline");
       return JSON.stringify({
-        https: location.protocol === "https:",
+        scheme: location.protocol,
         key_in_url: location.search.indexOf("key=") >= 0,
         bridge: !!window.SahmApp,
-        pair_page: b.indexOf("هذه الصفحة تربط") >= 0,
+        ui_version: ui.version || "",
+        ui_builtin: !!ui.builtIn,
+        ui_updated: !!ui.updated,
+        ci_marker: document.body ? (document.body.getAttribute("data-ci") || "") : "",
+        proxy: document.body ? (document.body.getAttribute("data-proxy") || "") : "",
+        offline: !!off && off.classList.contains("show"),
+        offline_text: off ? off.innerText : "",
         strategies: b.indexOf("الاستراتيجيات") >= 0,
         q1: b.indexOf("Q1") >= 0,
         m1: b.indexOf("M1") >= 0,

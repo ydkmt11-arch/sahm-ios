@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CI</title>
+<style>
+  body { margin: 0; padding: calc(env(safe-area-inset-top) + 48px) 24px 40px; background: #0a1316; color: #e7eff1;
+         font: 18px/1.7 -apple-system, sans-serif; }
+  h1 { color: #e9b860; font-size: 26px; }
+</style>
+</head>
+<body data-ci="CI-UI-1">
+<h1>واجهة CI المضمّنة في التطبيق</h1>
+<p>هذه الصفحة تأتي من داخل ملف <bdi dir="ltr">IPA</bdi>، وتنتظر التحديث الذاتي.</p>
+<p id="p">…</p>
+<script>
+  (function () {
+    var b = document.body;
+    fetch("/api/health").then(function (r) {
+      return r.text().then(function (t) { b.setAttribute("data-proxy", r.status + ":" + t.trim().slice(0, 40)); });
+    }).catch(function () { b.setAttribute("data-proxy", "error"); });
+    if (window.SahmApp) {
+      document.getElementById("p").textContent = "الإصدار " + window.SahmApp.version + " · الواجهة " + window.SahmApp.ui.version;
+      window.SahmApp.ready();
+    }
+  })();
+</script>
+</body>
+</html>
