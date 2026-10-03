@@ -295,11 +295,15 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
 
     private func showOffline(reason: String) {
         screen = .offline
+        // built with if/else on purpose: `cond ? nil : (text, closure)` crashes the Swift 6.3 type checker
+        var secondary: (String, () -> Void)?
+        if !hasBundledKey {
+            secondary = ("إلغاء الربط", { [weak self] in self?.unpair() })
+        }
+        let primary: (String, () -> Void) = ("إعادة المحاولة الآن", { [weak self] in self?.start() })
         showPanel(title: "المنصة غير متاحة الآن",
                   body: "تأكد أن جهاز الكمبيوتر يعمل وأن سهم مشغّل. يعيد التطبيق المحاولة تلقائيًا كل دقيقة تقريبًا.",
-                  detail: reason, busy: false,
-                  primary: ("إعادة المحاولة الآن", { [weak self] in self?.start() }),
-                  secondary: hasBundledKey ? nil : ("إلغاء الربط", { [weak self] in self?.unpair() }))
+                  detail: reason, busy: false, primary: primary, secondary: secondary)
     }
 
     private func showPanel(title: String?, body: String?, detail: String?, detailIsError: Bool = false,

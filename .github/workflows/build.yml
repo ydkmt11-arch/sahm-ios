@@ -45,7 +45,7 @@ jobs:
             -destination 'generic/platform=iOS' -derivedDataPath build \
             CURRENT_PROJECT_VERSION=${{ github.run_number }} \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build >> build.log 2>&1 \
-            || { grep -nE "error:|BUILD FAILED" build.log | head -60; exit 1; }
+            || { grep -nE "error:|Stack dump|While type-checking|Please submit a bug report|Command [A-Za-z]+ failed|BUILD FAILED" build.log | head -60; exit 1; }
           grep -nE "warning: " build.log | head -40 || true
 
       - name: Fakesign, package, and prove SideStore can sign it
@@ -81,7 +81,7 @@ jobs:
           xcodebuild -project Sahm.xcodeproj -scheme Sahm -configuration Debug -sdk iphonesimulator \
             -destination 'generic/platform=iOS Simulator' -derivedDataPath simbuild \
             CURRENT_PROJECT_VERSION=${{ github.run_number }} \
-            CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO build > sim-build.log 2>&1 || { grep -nE "error:" sim-build.log | head -40; exit 1; }
+            CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO build > sim-build.log 2>&1 || { grep -nE "error:|Stack dump|While type-checking|Please submit a bug report|Command [A-Za-z]+ failed|BUILD FAILED" sim-build.log | head -40; exit 1; }
           rm -rf simpkg && mkdir -p simpkg/Payload && cp -R simbuild/Build/Products/Debug-iphonesimulator/Sahm.app simpkg/Payload/
           (cd simpkg && zip -qry ../SahmSim.ipa Payload)
           UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print([x['udid'] for k,v in sorted(d.items(), reverse=True) if 'iOS' in k for x in v if x['name'].startswith('iPhone')][0])")
@@ -119,7 +119,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          { grep -nE "error:|fatal|BUILD FAILED|FAIL|TIMEOUT" build.log sim-build.log sim-report.txt 2>/dev/null | head -150; echo ----; tail -120 build.log 2>/dev/null; } > errors.txt || true
+          { grep -nE "error:|Stack dump|While type-checking|Please submit a bug report|Command [A-Za-z]+ failed|BUILD FAILED|fatal|FAIL|TIMEOUT" build.log sim-build.log sim-report.txt 2>/dev/null | head -150; echo ----; tail -120 build.log 2>/dev/null; } > errors.txt || true
           FILES="errors.txt"
           for f in shot-*.png generic-timeout.png personal-ci-timeout.png wrongkey-timeout.png real-*.png.enc ci-*.json sim-report.txt; do if [ -f "$f" ]; then FILES="$FILES $f"; fi; done
           gh release create "fail-${{ github.run_number }}" $FILES --prerelease --title "failed ${{ github.run_number }}" --notes "build failed at ${{ github.sha }}"
