@@ -88,21 +88,25 @@ jobs:
           echo "UDID=$UDID" >> "$GITHUB_ENV"
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl status_bar "$UDID" override --time 9:41 --batteryState charged --batteryLevel 100 --wifiBars 3 2>/dev/null || true
           xcrun simctl list devices | grep "$UDID"
 
       - name: Simulator - public scenarios
         run: |
           chmod +x ci/sim.sh
-          { ci/sim.sh generic && ci/sim.sh personal-ci && ci/sim.sh wrongkey && ci/sim.sh deeplink; } 2>&1 | tee sim-report.txt
+          { ci/sim.sh generic && ci/sim.sh personal-ci && ci/sim.sh wrongkey; } 2>&1 | tee sim-report.txt
 
       - name: Simulator - the owner's live platform (screenshots encrypted)
         env:
           APP_KEY: ${{ secrets.APP_KEY }}
         run: |
           python3 -m venv sealenv && sealenv/bin/pip install -q cryptography
-          rc=0; ci/sim.sh real || rc=$?
+          set +e; ci/sim.sh real 2>&1 | tee -a sim-report.txt; rc=${PIPESTATUS[0]}; set -e
           if ls real-*.png >/dev/null 2>&1; then sealenv/bin/python ci/seal.py real-*.png; fi
           exit $rc
+
+      - name: Simulator - deep link (last, its system prompt stays on screen)
+        run: ci/sim.sh deeplink 2>&1 | tee -a sim-report.txt
 
       - name: Publish release
         env:

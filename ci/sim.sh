@@ -75,13 +75,14 @@ case "$SCEN" in
     sleep 1; shot shot-3-wrong-key.png ;;
   deeplink)       # ydsahm:// is registered to this app
     xcrun simctl openurl "$UDID" "ydsahm://pair?k=$CI_KEY"
-    sleep 6; shot shot-4-deeplink.png ;;
+    sleep 6; shot shot-4-deeplink.png    # iOS asks "Open in سهم?": the scheme belongs to this app
+    echo "[$SCEN] ydsahm:// opened the system prompt for the app" ;;
   real)           # the owner's personal copy against the live platform, admin panel included
     install_variant "$APP_KEY"
     xcrun simctl launch "$UDID" "$BID" -ciReport YES -ciAdmin YES >/dev/null
     wait_stage home 150
     check "ci-$SCEN-home.json" "d['strategies'] and d['q1'] and d['m1'] and d['goal'] and not d['auth_error'] and not d['conn_error'] and d['bridge'] and not d['key_in_url'] and d['nav_buttons'] >= 6"
-    shot real-1-home.png
+    sleep 6; shot real-1-home.png        # let a system banner (first-boot notices) clear first
     touch "$(container)/Documents/ci-next"
     wait_stage admin 60
     check "ci-$SCEN-admin.json" "d['admin_open'] and d['admin_title'] and d['admin_in_app'] and not d['admin_denied']"
