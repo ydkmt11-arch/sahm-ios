@@ -1,0 +1,11 @@
+build/
+simbuild/
+Payload/
+*.ipa
+*.ipa.sha256
+*.xcodeproj/
+icon.b64
+Sahm/Assets.xcassets/AppIcon.appiconset/*.png
+pointercheck
+*.log
+shot-*.png

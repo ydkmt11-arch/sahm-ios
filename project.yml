@@ -1,0 +1,35 @@
+name: Sahm
+options:
+  bundleIdPrefix: com.sahm
+  deploymentTarget:
+    iOS: "15.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+targets:
+  Sahm:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sahm
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sahm.app
+        PRODUCT_NAME: Sahm
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
+        INFOPLIST_FILE: Support/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Manual
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+schemes:
+  Sahm:
+    build:
+      targets:
+        Sahm: all
+    run:
+      config: Debug
+    archive:
+      config: Release
