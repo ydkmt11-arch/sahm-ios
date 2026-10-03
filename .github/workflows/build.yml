@@ -66,16 +66,25 @@ jobs:
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
           xcrun simctl install "$UDID" simbuild/Build/Products/Debug-iphonesimulator/Sahm.app
+          # 1) first launch, no key: the pairing panel
           xcrun simctl launch "$UDID" com.sahm.app -pointerFile p_ci.json
           sleep 10
           xcrun simctl io "$UDID" screenshot shot-1-first-launch.png
-          xcrun simctl openurl "$UDID" "sahm://pair?k=ci-dummy-key-0000000000"
+          xcrun simctl terminate "$UDID" com.sahm.app
+          # 2) paired (key given as a launch argument = the UserDefaults fallback KeyStore reads):
+          #    pointer p_ci.json -> decrypt -> /api/health -> the page loads in the WKWebView
+          xcrun simctl launch "$UDID" com.sahm.app -sahm.pairKey ci-dummy-key-0000000000 -pointerFile p_ci.json
           sleep 25
           xcrun simctl io "$UDID" screenshot shot-2-paired-loaded.png
           xcrun simctl terminate "$UDID" com.sahm.app
-          xcrun simctl launch "$UDID" com.sahm.app -pointerFile p.json
+          # 3) the REAL pointer with a key that cannot open it: red "key no longer valid" + pairing button
+          xcrun simctl launch "$UDID" com.sahm.app -sahm.pairKey ci-dummy-key-0000000000 -pointerFile p.json
           sleep 20
           xcrun simctl io "$UDID" screenshot shot-3-real-pointer-wrong-key.png
+          # 4) sahm:// is registered: iOS asks to open it in the app
+          xcrun simctl openurl "$UDID" "sahm://pair?k=ci-dummy-key-0000000000"
+          sleep 6
+          xcrun simctl io "$UDID" screenshot shot-4-deeplink-prompt.png
 
       - name: Publish release
         env:
