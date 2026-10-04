@@ -1,0 +1,4 @@
+/* The name under the icon. Info.plist keeps the English "Sahm": SideStore sends CFBundleDisplayName to Apple as
+   the App ID name and Apple accepts only English letters, digits and spaces there ("invalid value for appIdName"). */
+"CFBundleDisplayName" = "سهم";
+"NSFaceIDUsageDescription" = "يستخدم سهم Face ID لقفل التطبيق إذا فعّلت القفل من «المزيد».";

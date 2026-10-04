@@ -57,6 +57,16 @@ jobs:
           plutil -lint "$APP/Info.plist" | tee -a build.log
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")" = "$BID"
           echo "bundle id $BID, version $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist") build $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist")" | tee -a build.log
+          # SideStore (SideSign AppBundle.name) sends CFBundleDisplayName, else CFBundleName, to Apple as the App ID name;
+          # Apple rejects anything but English letters, digits and spaces ("An invalid value 'سهم' ... 'appIdName'").
+          for k in CFBundleDisplayName CFBundleName; do
+            v=$(/usr/libexec/PlistBuddy -c "Print :$k" "$APP/Info.plist")
+            echo "$v" | grep -Eq '^[A-Za-z0-9 ]+$' || { echo "::error::$k '$v' is not plain English: SideStore install fails (appIdName)"; exit 1; }
+          done
+          for l in ar en; do
+            plutil -p "$APP/$l.lproj/InfoPlist.strings" | tee -a build.log | grep -q "سهم" || { echo "::error::$l.lproj/InfoPlist.strings has no Arabic name"; exit 1; }
+          done
+          echo "App ID name '$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$APP/Info.plist")' OK for Apple; home-screen name from ar/en InfoPlist.strings" | tee -a build.log
           codesign --force --sign - --timestamp=none "$APP"
           codesign -dv "$APP" 2>&1 | tee -a build.log
           codesign --verify --deep --strict "$APP" && echo "codesign verify OK" | tee -a build.log
