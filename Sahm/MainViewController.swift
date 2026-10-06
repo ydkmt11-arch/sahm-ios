@@ -43,6 +43,7 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
     private var backgroundAt: Date?
 
     private var ciReports = 0
+    private var ciFirstReported = false
     private var ciFirstDone = false
     private var ciPending: WebBundle.Root?
 
@@ -139,6 +140,7 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
                                         userInfo: nil, repeats: true)
         if Link.shared.base != nil { update(force: false, manual: false) }      // at most every 10 minutes
         Notifier.shared.foreground()                                          // notifications: now + every minute
+        ciFirstLaunchReport()
     }
 
     /// The app went to the background: hide its content from the app switcher when the lock is on.
@@ -865,6 +867,21 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
     // MARK: - CI self-report (only with the launch argument -ciReport YES; inert in normal use)
 
     private var ciEnabled: Bool { UserDefaults.standard.bool(forKey: "ciReport") }
+
+    /// CI only (-ciFirstReport YES): the pairing panel reports itself before the app has asked iOS for notification
+    /// permission, so the first-launch scenario gets its own report a few seconds later.
+    private func ciFirstLaunchReport() {
+        guard ciEnabled, UserDefaults.standard.bool(forKey: "ciFirstReport"), !ciFirstReported else { return }
+        ciFirstReported = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            guard let self = self else { return }
+            Task { @MainActor in
+                var report: [String: Any] = ["stage": "first"]
+                report["notify"] = await Notifier.shared.ciState()
+                self.ciWrite(report)
+            }
+        }
+    }
 
     private var documents: URL? { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first }
 

@@ -80,10 +80,11 @@ case "$SCEN" in
     sleep 1; shot shot-4-wrong-key.png ;;
   firstlaunch)    # v1.4: the system permission sheet appears by itself on the very first launch (no -ciNoPrompt)
     install_variant ""
-    xcrun simctl launch "$UDID" "$BID" -ciReport YES -pointerFile p_ci.json >/dev/null
-    wait_stage panel 90
-    # nobody taps in CI, so the sheet stays on screen: «prompted» proves the app asked without being told to
-    check "ci-$SCEN-panel.json" "d['notify']['asked'] and d['notify']['prompted'] and d['notify']['device_len'] == 32"
+    xcrun simctl launch "$UDID" "$BID" -ciReport YES -ciFirstReport YES -pointerFile p_ci.json >/dev/null
+    wait_stage first 90
+    # nobody taps in CI, so the sheet stays on screen and the status is still notDetermined: «prompted» proves the
+    # app asked iOS by itself, without any switch being touched
+    check "ci-$SCEN-first.json" "d['notify']['asked'] and d['notify']['prompted'] and d['notify']['device_len'] == 32 and d['notify']['status'] == 'notDetermined'"
     sleep 3; shot shot-6-first-launch-permission.png
     xcrun simctl terminate "$UDID" "$BID" >/dev/null 2>&1 || true
     xcrun simctl uninstall "$UDID" "$BID" >/dev/null 2>&1 || true   # the system sheet goes with the app
