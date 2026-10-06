@@ -3,23 +3,35 @@ import Foundation
 import UIKit
 import UserNotifications
 
-/// The owner's SAHM notifications as iPhone notifications (owner 2026-10-06: «ابي الاشعارات بالبرنامج ال ipa»).
+/// SAHM's notifications as iPhone notifications (owner 2026-10-06: «ابي الاشعارات بالبرنامج ال ipa» and, in v1.4,
+/// «أول ما يفتح التطبيق تطلع النافذة الأصلية تطلب الإذن مثل أي تطبيق»).
 ///
-/// A free Apple ID cannot sign remote push (APNs needs a paid developer account), so the app fetches the server's
-/// feed itself — GET /api/notify/feed?since=<last id> — every minute while it is open, and whenever iOS wakes it in
-/// the background (Background App Refresh: iOS decides when, usually 15 minutes or more apart, and never after the
-/// app was swiped away until it is opened again). New items become local notifications with the app's own name and
-/// icon. Off until the owner taps «تفعيل» in the page (SahmApp.notifyEnable), so nothing ever prompts by itself.
+/// HONEST LIMIT, stated in the interface too: this IPA is sideloaded with a FREE Apple ID, and free provisioning
+/// cannot carry the `aps-environment` entitlement, so APNs (remote push) is impossible without the paid Apple
+/// Developer Program. What this class does instead: it fetches the server's own feed —
+/// GET /api/notify/feed?since=<last id>&did=<this install> — every minute while the app is open, and whenever iOS
+/// wakes it (Background App Refresh + a Background Processing task). New items become LOCAL notifications with the
+/// app's name and icon. In the background iOS alone decides when (usually ≥15 minutes apart, never after the app was
+/// swiped away until it is opened again), so background delivery is best effort. Guaranteed-while-closed delivery is
+/// Telegram, or Web Push to سهم added to the Home Screen.
+///
+/// v1.4: the system permission sheet appears by itself on the FIRST launch (like any other app); the switch in the
+/// page stays as a fallback, and each install has its own device id so every phone keeps its own preferences.
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     static let shared = Notifier()
     static let refreshTask = "io.github.ydkmt11arch.sahm.refresh"
+    static let processTask = "io.github.ydkmt11arch.sahm.process"
 
     private let enabledKey = "sahm.notify.enabled"
+    private let askedKey = "sahm.notify.asked"        // the system sheet was already shown once
     private let lastIdKey = "sahm.notify.lastId"
+    private let shownKey = "sahm.notify.shown"        // ids already shown: never notify the same item twice
     private let unreadKey = "sahm.notify.unread"
+    private let deviceKey = "sahm.notify.device"      // this install's own id (one subscriber on the server)
     private let lastURLKey = "sahm.lastURL"           // written by MainViewController after a verified connection
     private var timer: Timer?
     private var fetching = false
+    private var asked = false                         // this process asked the system for permission
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 20
@@ -32,6 +44,18 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     var enabled: Bool { UserDefaults.standard.bool(forKey: enabledKey) }
 
+    /// CI (-ciNoPrompt YES): never show the system sheet, so it cannot cover a screenshot.
+    private var noPrompt: Bool { UserDefaults.standard.bool(forKey: "ciNoPrompt") }
+
+    /// One id per install, made on first use and kept in UserDefaults. The page gets it through the bridge and sends
+    /// it with its own requests, so the phone and the interface are the SAME subscriber on the server.
+    var deviceId: String {
+        if let id = UserDefaults.standard.string(forKey: deviceKey), !id.isEmpty { return id }
+        let id = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        UserDefaults.standard.set(id, forKey: deviceKey)
+        return id
+    }
+
     // MARK: - Launch and life cycle
 
     /// From application(_:didFinishLaunchingWithOptions:): iOS wants background handlers registered before launch ends.
@@ -42,37 +66,88 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
                 task.setTaskCompleted(success: false)
                 return
             }
-            Notifier.shared.runBackground(refresh)
+            Notifier.shared.runRefresh(refresh)
+        }
+        BGTaskScheduler.shared.register(forTaskWithIdentifier: Notifier.processTask, using: nil) { task in
+            guard let process = task as? BGProcessingTask else {
+                task.setTaskCompleted(success: false)
+                return
+            }
+            Notifier.shared.runProcessing(process)
         }
     }
 
-    /// The app is in front: clear the badge, fetch now and every 60 s.
+    /// The app is in front: ask for permission the very first time, clear the badge, fetch now and every 60 s.
     func foreground() {
         clearBadge()
         timer?.invalidate()
         timer = nil
+        askOnFirstLaunch()
         guard enabled else { return }
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
             Task { @MainActor in await Notifier.shared.fetch(background: false) }
         }
         Task { @MainActor in await self.fetch(background: false) }
+        schedule()
     }
 
-    /// The app left the screen: stop the timer and ask iOS for the next background wake-up.
+    /// The app left the screen: stop the timer and ask iOS for the next wake-up.
     func background() {
         timer?.invalidate()
         timer = nil
         schedule()
     }
 
-    private func schedule() {
-        guard enabled else { return }
-        let request = BGAppRefreshTaskRequest(identifier: Notifier.refreshTask)
-        request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
-        try? BGTaskScheduler.shared.submit(request)       // the simulator refuses: nothing to do about it
+    /// The native permission sheet, once, on the first launch — like any other iPhone app. If the user already
+    /// answered in an older version, nothing is shown and we simply follow his answer.
+    private func askOnFirstLaunch() {
+        guard !noPrompt, !UserDefaults.standard.bool(forKey: askedKey) else { return }
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            guard let self = self else { return }
+            guard settings.authorizationStatus == .notDetermined else {
+                DispatchQueue.main.async {
+                    UserDefaults.standard.set(true, forKey: self.askedKey)
+                    UserDefaults.standard.set(settings.authorizationStatus == .authorized, forKey: self.enabledKey)
+                    self.report()
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                UserDefaults.standard.set(true, forKey: self.askedKey)
+                self.asked = true
+                self.request()
+            }
+        }
     }
 
-    private func runBackground(_ task: BGAppRefreshTask) {
+    private func request() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+            DispatchQueue.main.async {
+                UserDefaults.standard.set(granted, forKey: self.enabledKey)
+                if granted {
+                    UserDefaults.standard.removeObject(forKey: self.lastIdKey)   // first sync = from now, no history
+                    self.foreground()
+                }
+                self.report()
+            }
+        }
+    }
+
+    /// Both background kinds, as often as iOS allows: a refresh (short, frequent) and a processing task (longer,
+    /// when the phone is idle). iOS alone decides if and when either runs; both are re-submitted after every run.
+    private func schedule() {
+        guard enabled else { return }
+        let refresh = BGAppRefreshTaskRequest(identifier: Notifier.refreshTask)
+        refresh.earliestBeginDate = Date(timeIntervalSinceNow: 10 * 60)
+        try? BGTaskScheduler.shared.submit(refresh)        // the simulator refuses: nothing to do about it
+        let process = BGProcessingTaskRequest(identifier: Notifier.processTask)
+        process.requiresNetworkConnectivity = true
+        process.requiresExternalPower = false
+        process.earliestBeginDate = Date(timeIntervalSinceNow: 20 * 60)
+        try? BGTaskScheduler.shared.submit(process)
+    }
+
+    private func runRefresh(_ task: BGAppRefreshTask) {
         schedule()                                        // the next wake-up first: one failed fetch never ends the chain
         let work = Task { @MainActor in
             let ok = await Notifier.shared.fetch(background: true)
@@ -81,7 +156,16 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         task.expirationHandler = { work.cancel() }
     }
 
-    // MARK: - Owner's switch (from the page)
+    private func runProcessing(_ task: BGProcessingTask) {
+        schedule()
+        let work = Task { @MainActor in
+            let ok = await Notifier.shared.fetch(background: true)
+            task.setTaskCompleted(success: ok)
+        }
+        task.expirationHandler = { work.cancel() }
+    }
+
+    // MARK: - The switch in the page (fallback after a refusal, or to stop them)
 
     func setEnabled(_ on: Bool) {
         guard on else {
@@ -89,33 +173,18 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             timer?.invalidate()
             timer = nil
             BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Notifier.refreshTask)
+            BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Notifier.processTask)
             report()
             return
         }
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
-            DispatchQueue.main.async {
-                UserDefaults.standard.set(granted, forKey: self.enabledKey)
-                if granted {
-                    UserDefaults.standard.removeObject(forKey: self.lastIdKey)   // first sync = from now, no history
-                    self.foreground()
-                    self.schedule()
-                }
-                self.report()
-            }
-        }
+        UserDefaults.standard.set(true, forKey: askedKey)
+        request()
     }
 
-    /// Tell the page: permission, the owner's switch, and whether iOS allows background refresh.
+    /// Tell the page: permission, the switch, whether iOS allows background refresh, and this install's id.
     func report() {
         UNUserNotificationCenter.current().getNotificationSettings { settings in
-            let status: String
-            switch settings.authorizationStatus {
-            case .authorized: status = "authorized"
-            case .denied: status = "denied"
-            case .provisional: status = "provisional"
-            case .ephemeral: status = "ephemeral"
-            default: status = "notDetermined"
-            }
+            let status = Notifier.name(of: settings.authorizationStatus)
             DispatchQueue.main.async {
                 let bg: String
                 switch UIApplication.shared.backgroundRefreshStatus {
@@ -124,8 +193,19 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
                 case .restricted: bg = "restricted"
                 @unknown default: bg = "unknown"
                 }
-                self.onState?(["status": status, "enabled": self.enabled, "bg": bg])
+                self.onState?(["status": status, "enabled": self.enabled, "bg": bg, "device": self.deviceId,
+                               "asked": UserDefaults.standard.bool(forKey: self.askedKey)])
             }
+        }
+    }
+
+    private static func name(of status: UNAuthorizationStatus) -> String {
+        switch status {
+        case .authorized: return "authorized"
+        case .denied: return "denied"
+        case .provisional: return "provisional"
+        case .ephemeral: return "ephemeral"
+        default: return "notDetermined"
         }
     }
 
@@ -140,7 +220,9 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     private func request(base: URL, key: String, query: [URLQueryItem], timeout: TimeInterval) -> URLRequest? {
         var comps = URLComponents(url: base.appendingPathComponent("api/notify/feed"), resolvingAgainstBaseURL: false)
-        comps?.queryItems = query.isEmpty ? nil : query
+        var items = query
+        items.append(URLQueryItem(name: "did", value: deviceId))     // this install = one subscriber on the server
+        comps?.queryItems = items
         guard let url = comps?.url else { return nil }
         var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
         req.setValue(key, forHTTPHeaderField: "X-Dash-Key")
@@ -177,26 +259,35 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    /// A long gap shows the newest six and one line for the rest.
+    /// A long gap shows the newest six and one line for the rest. Each feed id is shown at most once.
     @MainActor
     private func show(_ items: [[String: Any]], more: Int) async {
         let center = UNUserNotificationCenter.current()
-        let shown = Array(items.suffix(6))
-        let hidden = more + items.count - shown.count
+        var done = UserDefaults.standard.array(forKey: shownKey) as? [Int] ?? []
+        let fresh = items.filter { item in
+            guard let id = item["id"] as? Int else { return false }
+            return !done.contains(id)
+        }
+        let shown = Array(fresh.suffix(6))
+        let hidden = more + fresh.count - shown.count
         for item in shown {
+            let id = item["id"] as? Int ?? 0
             let content = UNMutableNotificationContent()
             content.title = item["title"] as? String ?? "سهم"
             content.body = item["text"] as? String ?? ""
             content.sound = .default
             content.threadIdentifier = item["kind"] as? String ?? "sahm"
             content.badge = NSNumber(value: bumpUnread())
-            let id = "sahm-\(item["id"] as? Int ?? Int(Date().timeIntervalSince1970))"
-            try? await center.add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+            try? await center.add(UNNotificationRequest(identifier: "sahm-\(id)", content: content, trigger: nil))
+            done.append(id)
+        }
+        if !done.isEmpty {
+            UserDefaults.standard.set(Array(done.suffix(80)), forKey: shownKey)
         }
         if hidden > 0 {
             let content = UNMutableNotificationContent()
             content.title = "سهم"
-            content.body = "و\(hidden) تنبيهات أخرى — افتح سهم ← لوحة الإدارة ← الإشعارات."
+            content.body = "و\(hidden) تنبيهات أخرى — افتح سهم واضغط الجرس في أعلى الشاشة."
             content.sound = nil
             content.badge = NSNumber(value: bumpUnread())
             try? await center.add(UNNotificationRequest(identifier: "sahm-more-\(Date().timeIntervalSince1970)",
@@ -234,7 +325,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     // MARK: - CI
 
-    /// CI only: one read of the feed (ci=1: not counted as the owner's phone), nothing shown, nothing stored.
+    /// CI only: one read of the feed (ci=1: not counted as a real phone), nothing shown, nothing stored.
     @MainActor
     func ciFetch() async -> String {
         guard let key = KeyStore.read() ?? Link.shared.key else { return "no-key" }
@@ -251,5 +342,22 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         } catch {
             return "error:\(error.localizedDescription)"
         }
+    }
+
+    /// CI only: a synchronous snapshot for reports written outside an async context (the pairing panel).
+    var ciSync: [String: Any] {
+        ["asked": UserDefaults.standard.bool(forKey: askedKey), "prompted": asked,
+         "enabled": enabled, "device_len": deviceId.count]
+    }
+
+    /// CI only: what happened with the first-launch permission sheet.
+    @MainActor
+    func ciState() async -> [String: Any] {
+        let settings = await withCheckedContinuation { (c: CheckedContinuation<UNNotificationSettings, Never>) in
+            UNUserNotificationCenter.current().getNotificationSettings { c.resume(returning: $0) }
+        }
+        return ["asked": UserDefaults.standard.bool(forKey: askedKey), "prompted": asked,
+                "status": Notifier.name(of: settings.authorizationStatus), "enabled": enabled,
+                "device_len": deviceId.count]
     }
 }

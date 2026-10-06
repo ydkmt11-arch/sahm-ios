@@ -496,7 +496,8 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         view.bringSubviewToFront(panel)
         if !lockCover.isHidden { view.bringSubviewToFront(lockCover) }
         if !busy {
-            ciWrite(["stage": "panel", "title": title ?? "", "body": body ?? "", "detail": detail ?? ""])
+            ciWrite(["stage": "panel", "title": title ?? "", "body": body ?? "", "detail": detail ?? "",
+                     "notify": Notifier.shared.ciSync])
         }
     }
 
@@ -535,6 +536,7 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         payload["ui"] = ui
         payload["lock"] = lock
         payload["notify"] = notify
+        payload["deviceId"] = Notifier.shared.deviceId      // the page and the phone are one subscriber
         let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data("{}".utf8)
         let json = String(data: data, encoding: .utf8) ?? "{}"
         let source = """
@@ -904,15 +906,12 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
                 report["probe_error"] = error.map { String(describing: $0) } ?? "no result"
             }
             guard let self = self else { return }
-            guard stage == "home" else {
-                self.ciWrite(report)
-                next?()
-                return
-            }
             let partial = report
+            let withFeed = stage == "home"
             Task { @MainActor in                        // the native notification fetch reaches the server's feed
                 var full = partial
-                full["notify_feed"] = await Notifier.shared.ciFetch()
+                full["notify"] = await Notifier.shared.ciState()
+                if withFeed { full["notify_feed"] = await Notifier.shared.ciFetch() }
                 self.ciWrite(full)
                 next?()
             }

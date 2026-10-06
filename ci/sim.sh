@@ -1,7 +1,7 @@
 #!/bin/bash
 # Simulator scenarios for the Sahm app. The app writes Documents/ci.json ({"stage": ...}) when launched with
 # -ciReport YES; this script waits for each stage and asserts its content.
-# Usage: ci/sim.sh <generic|personal-ci|wrongkey|deeplink|real>   env: UDID, BID, CI_KEY, APP_KEY (real only)
+# Usage: ci/sim.sh <generic|personal-ci|wrongkey|firstlaunch|deeplink|real>   env: UDID, BID, CI_KEY, APP_KEY (real only)
 set -euo pipefail
 SCEN="$1"
 
@@ -59,13 +59,13 @@ PY
 case "$SCEN" in
   generic)        # public IPA, never paired: the pairing panel
     install_variant ""
-    xcrun simctl launch "$UDID" "$BID" -ciReport YES -pointerFile p_ci.json >/dev/null
+    xcrun simctl launch "$UDID" "$BID" -ciNoPrompt YES -ciReport YES -pointerFile p_ci.json >/dev/null
     wait_stage panel 60
     check "ci-$SCEN-panel.json" "d['title'] == 'اربط التطبيق بمنصتك' and d['detail'] == ''"
     sleep 1; shot shot-1-generic-unpaired.png ;;
   personal-ci)    # interface built into the IPA, runs from the phone, then updates itself from the server
     install_variant "$CI_KEY" ci/www-test
-    xcrun simctl launch "$UDID" "$BID" -ciReport YES -pointerFile p_ci.json >/dev/null
+    xcrun simctl launch "$UDID" "$BID" -ciNoPrompt YES -ciReport YES -pointerFile p_ci.json >/dev/null
     wait_stage home 60
     check "ci-$SCEN-home.json" "d['ci_marker'] == 'CI-UI-1' and d['bridge'] and d['ui_builtin'] and d['scheme'] == 'sahmui:'"
     shot shot-2-built-in-interface.png
@@ -74,19 +74,29 @@ case "$SCEN" in
     sleep 1; shot shot-3-self-updated.png ;;
   wrongkey)       # a key that cannot open the real pointer: red message, pairing button
     install_variant ""
-    xcrun simctl launch "$UDID" "$BID" -ciReport YES -sahm.pairKey "$CI_KEY" >/dev/null
+    xcrun simctl launch "$UDID" "$BID" -ciNoPrompt YES -ciReport YES -sahm.pairKey "$CI_KEY" >/dev/null
     wait_stage panel 90
     check "ci-$SCEN-panel.json" "'لم يعد صالح' in d['detail']"
     sleep 1; shot shot-4-wrong-key.png ;;
+  firstlaunch)    # v1.4: the system permission sheet appears by itself on the very first launch (no -ciNoPrompt)
+    install_variant ""
+    xcrun simctl launch "$UDID" "$BID" -ciReport YES -pointerFile p_ci.json >/dev/null
+    wait_stage panel 90
+    # nobody taps in CI, so the sheet stays on screen: «prompted» proves the app asked without being told to
+    check "ci-$SCEN-panel.json" "d['notify']['asked'] and d['notify']['prompted'] and d['notify']['device_len'] == 32"
+    sleep 3; shot shot-6-first-launch-permission.png
+    xcrun simctl terminate "$UDID" "$BID" >/dev/null 2>&1 || true
+    xcrun simctl uninstall "$UDID" "$BID" >/dev/null 2>&1 || true   # the system sheet goes with the app
+    echo "[$SCEN] the first launch asked for notification permission by itself" ;;
   deeplink)       # ydsahm:// is registered to this app
     xcrun simctl openurl "$UDID" "ydsahm://pair?k=$CI_KEY"
     sleep 6; shot shot-5-deeplink.png    # iOS asks "Open in سهم?": the scheme belongs to this app
     echo "[$SCEN] ydsahm:// opened the system prompt for the app" ;;
   real)           # the owner's copy on the live platform: interface downloaded from the PC, admin panel, then PC "off"
     install_variant "$APP_KEY"
-    xcrun simctl launch "$UDID" "$BID" -ciReport YES -ciAdmin YES >/dev/null
+    xcrun simctl launch "$UDID" "$BID" -ciNoPrompt YES -ciReport YES -ciAdmin YES >/dev/null
     wait_stage home 180
-    check "ci-$SCEN-home.json" "d['strategies'] and d['q1'] and d['m1'] and d['goal'] and not d['auth_error'] and not d['conn_error'] and d['bridge'] and not d['key_in_url'] and d['nav_buttons'] >= 5 and d['scheme'] == 'sahmui:' and not d['ui_builtin'] and len(d['ui_version']) == 12 and d['notify_bridge'] and d['notify_feed'].startswith('200:')"
+    check "ci-$SCEN-home.json" "d['strategies'] and d['q1'] and d['m1'] and d['goal'] and not d['auth_error'] and not d['conn_error'] and d['bridge'] and not d['key_in_url'] and d['nav_buttons'] >= 5 and d['scheme'] == 'sahmui:' and not d['ui_builtin'] and len(d['ui_version']) == 12 and d['notify_bridge'] and d['notify_feed'].startswith('200:') and d['notify']['device_len'] == 32"
     sleep 6; shot real-1-home.png        # let a system banner (first-boot notices) clear first
     touch "$(container)/Documents/ci-next"
     wait_stage admin 60
@@ -94,7 +104,7 @@ case "$SCEN" in
     shot real-2-admin.png
     xcrun simctl terminate "$UDID" "$BID" >/dev/null 2>&1 || true
     rm -f "$(container)/Documents/ci.json" "$(container)/Documents/ci-next"
-    xcrun simctl launch "$UDID" "$BID" -ciReport YES -ciForceOffline YES -ciStage offline >/dev/null
+    xcrun simctl launch "$UDID" "$BID" -ciNoPrompt YES -ciReport YES -ciForceOffline YES -ciStage offline >/dev/null
     wait_stage offline 90
     check "ci-$SCEN-offline.json" "d['offline'] and d['strategies'] and d['q1'] and d['m1'] and d['scheme'] == 'sahmui:'"
     sleep 2; shot real-3-offline.png ;;
