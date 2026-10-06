@@ -12,3 +12,12 @@
 
 ## التثبيت
 من سهم في تيليجرام: ضغط مطوّل على «الرئيسية» ← «تثبيت تطبيق الآيفون» ← «تثبيت في SideStore».
+
+## Notifications (v1.3)
+The owner's SAHM notifications arrive as iPhone notifications with the app's own name and icon. A free Apple ID cannot
+sign remote push (APNs needs a paid developer account), so `Sahm/Notifier.swift` polls the server's
+`GET /api/notify/feed?since=<id>` — every minute while the app is open, and whenever iOS wakes it in the background
+(Background App Refresh, `UIBackgroundModes: fetch`, task `io.github.ydkmt11arch.sahm.refresh`; iOS decides when,
+usually 15 minutes or more apart, never after a force-quit). Off until the owner taps «تفعيل» in the admin panel's
+notifications section (`SahmApp.notifyEnable(true)` → the iOS permission prompt), so nothing prompts by itself.
+CI: the real scenario checks the bridge and a native read of the feed (`?ci=1`, not counted as the owner's phone).

@@ -86,7 +86,7 @@ case "$SCEN" in
     install_variant "$APP_KEY"
     xcrun simctl launch "$UDID" "$BID" -ciReport YES -ciAdmin YES >/dev/null
     wait_stage home 180
-    check "ci-$SCEN-home.json" "d['strategies'] and d['q1'] and d['m1'] and d['goal'] and not d['auth_error'] and not d['conn_error'] and d['bridge'] and not d['key_in_url'] and d['nav_buttons'] >= 5 and d['scheme'] == 'sahmui:' and not d['ui_builtin'] and len(d['ui_version']) == 12"
+    check "ci-$SCEN-home.json" "d['strategies'] and d['q1'] and d['m1'] and d['goal'] and not d['auth_error'] and not d['conn_error'] and d['bridge'] and not d['key_in_url'] and d['nav_buttons'] >= 5 and d['scheme'] == 'sahmui:' and not d['ui_builtin'] and len(d['ui_version']) == 12 and d['notify_bridge'] and d['notify_feed'].startswith('200:')"
     sleep 6; shot real-1-home.png        # let a system banner (first-boot notices) clear first
     touch "$(container)/Documents/ci-next"
     wait_stage admin 60

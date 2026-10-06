@@ -122,11 +122,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="v1.2.${{ github.run_number }}"
+          TAG="v1.3.${{ github.run_number }}"
           FILES="Sahm.ipa Sahm.ipa.sha256 sim-report.txt"
           for f in shot-*.png real-*.png.enc ci-*.json; do if [ -f "$f" ]; then FILES="$FILES $f"; fi; done
           gh release create "$TAG" $FILES --latest --title "سهم $TAG" \
-            --notes "Fakesigned IPA, bundle id $BID: SideStore / AltStore / Sideloadly re-sign it with the user's Apple ID. Built from ${{ github.sha }}. Simulator checks passed: generic; personal copy with a built-in interface that updates itself from the server (signed manifest, per-file hashes) and reaches the API through the in-app proxy; wrong key; deep link; the owner's live platform (interface downloaded from the PC, admin panel, then offline with the saved copy; screenshots encrypted)."
+            --notes "Fakesigned IPA, bundle id $BID: SideStore / AltStore / Sideloadly re-sign it with the user's Apple ID. Built from ${{ github.sha }}. Simulator checks passed: generic; personal copy with a built-in interface that updates itself from the server (signed manifest, per-file hashes) and reaches the API through the in-app proxy; wrong key; deep link; the owner's live platform (interface downloaded from the server, the notification feed read natively, admin panel, then offline with the saved copy; screenshots encrypted). v1.3: the owner's notifications as iPhone notifications (feed polled while open + Background App Refresh)."
 
       - name: Failure report
         if: failure()

@@ -59,6 +59,7 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         view.backgroundColor = Theme.ground
         scheme.forceOffline = UserDefaults.standard.bool(forKey: "ciForceOffline")
         Link.shared.onUnreachable = { [weak self] in self?.unreachable() }
+        Notifier.shared.onState = { [weak self] state in self?.notifyPage("sahm:notify", state) }
         buildWeb()
         buildPanel()
         buildLockCover()
@@ -137,12 +138,14 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         watchdog = Timer.scheduledTimer(timeInterval: 45, target: self, selector: #selector(tickTimer),
                                         userInfo: nil, repeats: true)
         if Link.shared.base != nil { update(force: false, manual: false) }      // at most every 10 minutes
+        Notifier.shared.foreground()                                          // notifications: now + every minute
     }
 
     /// The app went to the background: hide its content from the app switcher when the lock is on.
     func pause() {
         watchdog?.invalidate()
         watchdog = nil
+        Notifier.shared.background()                                          // iOS wakes the app for them later
         backgroundAt = Date()
         promptedThisVisit = false
         if LockGate.shared.enabled {
@@ -525,11 +528,13 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
                                  "builtIn": loaded?.builtIn ?? false,
                                  "updated": justUpdated]
         let lock: [String: Any] = ["kind": LockGate.shared.kind, "enabled": LockGate.shared.enabled]
+        let notify: [String: Any] = ["supported": true, "enabled": Notifier.shared.enabled]
         var payload: [String: Any] = ["platform": "ios"]
         payload["version"] = info["CFBundleShortVersionString"] as? String ?? "?"
         payload["build"] = info["CFBundleVersion"] as? String ?? "?"
         payload["ui"] = ui
         payload["lock"] = lock
+        payload["notify"] = notify
         let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data("{}".utf8)
         let json = String(data: data, encoding: .utf8) ?? "{}"
         let source = """
@@ -542,6 +547,9 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
           info.checkUpdate = function () { post({ checkUpdate: true }); };
           info.openExternal = function (url) { post({ open: String(url) }); };
           info.share = function (text, url) { post({ share: { text: String(text || ""), url: String(url || "") } }); };
+          info.notifyEnable = function (on) { post({ notify: on ? "on" : "off" }); };
+          info.notifyStatus = function () { post({ notify: "status" }); };
+          info.openSettings = function () { post({ settings: true }); };
           window.SahmApp = Object.freeze(info);
         })();
         """
@@ -569,6 +577,16 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
             UIApplication.shared.open(url)
         }
         if let item = body["share"] as? [String: Any] { share(item) }
+        if let n = body["notify"] as? String {
+            switch n {
+            case "on": Notifier.shared.setEnabled(true)
+            case "off": Notifier.shared.setEnabled(false)
+            default: Notifier.shared.report()
+            }
+        }
+        if body["settings"] != nil, let url = URL(string: UIApplication.openSettingsURLString) {
+            UIApplication.shared.open(url)
+        }
     }
 
     private func pageStarted() {
@@ -885,8 +903,19 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
             } else {
                 report["probe_error"] = error.map { String(describing: $0) } ?? "no result"
             }
-            self?.ciWrite(report)
-            next?()
+            guard let self = self else { return }
+            guard stage == "home" else {
+                self.ciWrite(report)
+                next?()
+                return
+            }
+            let partial = report
+            Task { @MainActor in                        // the native notification fetch reaches the server's feed
+                var full = partial
+                full["notify_feed"] = await Notifier.shared.ciFetch()
+                self.ciWrite(full)
+                next?()
+            }
         }
     }
 
@@ -919,6 +948,7 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         scheme: location.protocol,
         key_in_url: location.search.indexOf("key=") >= 0,
         bridge: !!window.SahmApp,
+        notify_bridge: !!(app.notifyEnable && app.notify && app.notify.supported),
         ui_version: ui.version || "",
         ui_builtin: !!ui.builtIn,
         ui_updated: !!ui.updated,
