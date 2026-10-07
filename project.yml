@@ -18,7 +18,7 @@ targets:
         # SideStore fail with error 3011 ("bundle identifier unavailable / already registered").
         PRODUCT_BUNDLE_IDENTIFIER: io.github.ydkmt11arch.sahm
         PRODUCT_NAME: Sahm
-        MARKETING_VERSION: "1.4"
+        MARKETING_VERSION: "1.5"
         CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1"
         INFOPLIST_FILE: Support/Info.plist

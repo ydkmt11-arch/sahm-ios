@@ -70,6 +70,10 @@ jobs:
           codesign --force --sign - --timestamp=none "$APP"
           codesign -dv "$APP" 2>&1 | tee -a build.log
           codesign --verify --deep --strict "$APP" && echo "codesign verify OK" | tee -a build.log
+          # free-account signing only: no aps-environment anywhere (a free Apple ID cannot carry it; SideStore would fail)
+          if codesign -d --entitlements - "$APP" 2>&1 | grep -q aps-environment || grep -q aps-environment ci/ldid-entitlements.plist; then
+            echo "::error::aps-environment found: a free Apple ID cannot sign push"; exit 1; fi
+          echo "no aps-environment (free-account signing)" | tee -a build.log
           zip -qry Sahm.ipa Payload
           shasum -a 256 Sahm.ipa | tee Sahm.ipa.sha256
           ls -la Sahm.ipa | tee -a build.log
@@ -122,11 +126,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="v1.4.${{ github.run_number }}"
+          TAG="v1.5.${{ github.run_number }}"
           FILES="Sahm.ipa Sahm.ipa.sha256 sim-report.txt"
           for f in shot-*.png real-*.png.enc ci-*.json; do if [ -f "$f" ]; then FILES="$FILES $f"; fi; done
           gh release create "$TAG" $FILES --latest --title "سهم $TAG" \
-            --notes "Fakesigned IPA, bundle id $BID: SideStore / AltStore / Sideloadly re-sign it with the user's Apple ID. Built from ${{ github.sha }}. Simulator checks passed: generic; personal copy with a built-in interface that updates itself from the server (signed manifest, per-file hashes) and reaches the API through the in-app proxy; wrong key; deep link; the owner's live platform (interface downloaded from the server, the notification feed read natively, admin panel, then offline with the saved copy; screenshots encrypted). v1.4: the system notification sheet appears by itself on the first launch (simulator scenario firstlaunch); every install has its own device id and its own preferences on the server; Background App Refresh AND a Background Processing task. A free Apple ID cannot carry aps-environment, so background delivery stays best effort (iOS decides when) - Telegram and Web Push to the interface on the Home Screen are the channels that always arrive while the app is closed."
+            --notes "Fakesigned IPA, bundle id $BID: SideStore / AltStore / Sideloadly re-sign it with the user's Apple ID. Built from ${{ github.sha }}. Simulator checks passed: generic; personal copy with a built-in interface that updates itself from the server (signed manifest, per-file hashes) and reaches the API through the in-app proxy; wrong key; deep link; the owner's live platform (interface downloaded from the server, the notification feed read natively, admin panel, then offline with the saved copy; screenshots encrypted). v1.5: after the first launch the page shows «لتصلك الإشعارات والتطبيق مقفل» once (simulator scenario personal-ci checks it is asked once and answered): link Telegram in one tap (t.me/<bot>?start=<one-time token>, bound by the bot) or open the Home-Screen Web Push guide in Safari. v1.4: the system notification sheet appears by itself on the first launch (simulator scenario firstlaunch); every install has its own device id and its own preferences on the server; Background App Refresh AND a Background Processing task. A free Apple ID cannot carry aps-environment, so background delivery stays best effort (iOS decides when) - Telegram and Web Push to the interface on the Home Screen are the channels that always arrive while the app is closed."
 
       - name: Failure report
         if: failure()

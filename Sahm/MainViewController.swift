@@ -555,6 +555,7 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
           info.notifyEnable = function (on) { post({ notify: on ? "on" : "off" }); };
           info.notifyStatus = function () { post({ notify: "status" }); };
           info.openSettings = function () { post({ settings: true }); };
+          info.closedSheetShown = function () { post({ closedSheet: "shown" }); };
           window.SahmApp = Object.freeze(info);
         })();
         """
@@ -589,6 +590,9 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
             default: Notifier.shared.report()
             }
         }
+        if body["closedSheet"] != nil {                  // the page showed «لتصلك الإشعارات والتطبيق مقفل»
+            UserDefaults.standard.set(true, forKey: Self.closedKey)
+        }
         if body["settings"] != nil, let url = URL(string: UIApplication.openSettingsURLString) {
             UIApplication.shared.open(url)
         }
@@ -600,6 +604,26 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         readyTimer?.invalidate()
         hidePanel()
         ciStage()
+        offerClosedSheet()
+    }
+
+    private static let closedKey = "sahm.closedSheet.v15"
+
+    /// v1.5: once, after the page started and iOS's own permission question is answered, the page is asked to show
+    /// «لتصلك الإشعارات والتطبيق مقفل» (link Telegram in one tap, or the Home-Screen guide): a free Apple ID gives this
+    /// app no push while it is closed. Only the page's answer (SahmApp.closedSheetShown) ends it, so an interface
+    /// that does not know the sheet yet is simply asked again at the next start.
+    private func offerClosedSheet(attempt: Int = 0) {
+        guard !UserDefaults.standard.bool(forKey: Self.closedKey), attempt < 45 else { return }
+        if !Notifier.shared.firstAskDone {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.offerClosedSheet(attempt: attempt + 1)
+            }
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            self?.notifyPage("sahm:closed-sheet", ["first": true])
+        }
     }
 
     private func haptic(_ kind: String) {
@@ -954,6 +978,7 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
             Task { @MainActor in                        // the native notification fetch reaches the server's feed
                 var full = partial
                 full["notify"] = await Notifier.shared.ciState()
+                full["closed_ack"] = UserDefaults.standard.bool(forKey: MainViewController.closedKey)
                 if withFeed { full["notify_feed"] = await Notifier.shared.ciFetch() }
                 self.ciWrite(full)
                 next?()
@@ -991,6 +1016,8 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         key_in_url: location.search.indexOf("key=") >= 0,
         bridge: !!window.SahmApp,
         notify_bridge: !!(app.notifyEnable && app.notify && app.notify.supported),
+        closed_bridge: typeof app.closedSheetShown === "function",
+        closed_sheet: document.body ? (document.body.getAttribute("data-closed-sheet") || "") : "",
         ui_version: ui.version || "",
         ui_builtin: !!ui.builtIn,
         ui_updated: !!ui.updated,

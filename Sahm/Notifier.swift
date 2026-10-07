@@ -46,6 +46,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     /// CI (-ciNoPrompt YES): never show the system sheet, so it cannot cover a screenshot.
     private var noPrompt: Bool { UserDefaults.standard.bool(forKey: "ciNoPrompt") }
+    /// iOS's permission question was answered (or skipped in CI): the page may show its own sheet now.
+    var firstAskDone: Bool { noPrompt || UserDefaults.standard.bool(forKey: askedKey) }
 
     /// One id per install, made on first use and kept in UserDefaults. The page gets it through the bridge and sends
     /// it with its own requests, so the phone and the interface are the SAME subscriber on the server.

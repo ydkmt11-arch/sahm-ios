@@ -68,9 +68,12 @@ case "$SCEN" in
     xcrun simctl launch "$UDID" "$BID" -ciNoPrompt YES -ciReport YES -pointerFile p_ci.json >/dev/null
     wait_stage home 60
     check "ci-$SCEN-home.json" "d['ci_marker'] == 'CI-UI-1' and d['bridge'] and d['ui_builtin'] and d['scheme'] == 'sahmui:'"
+    # v1.5: the page was asked for the closed-app sheet by itself, showed it and answered (the app remembers that)
+    check "ci-$SCEN-home.json" "d['closed_bridge'] and d['closed_sheet'] == '1' and d['closed_ack']"
     shot shot-2-built-in-interface.png
     wait_stage updated 120
     check "ci-$SCEN-updated.json" "d['ci_marker'] == 'CI-UI-2' and d['ui_updated'] and not d['ui_builtin'] and d['proxy'] == '200:ok'"
+    check "ci-$SCEN-updated.json" "d['closed_ack'] and d['closed_sheet'] == ''"     # once: not asked again
     sleep 1; shot shot-3-self-updated.png ;;
   wrongkey)       # a key that cannot open the real pointer: red message, pairing button
     install_variant ""

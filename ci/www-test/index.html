@@ -20,6 +20,11 @@
     fetch("/api/health").then(function (r) {
       return r.text().then(function (t) { b.setAttribute("data-proxy", r.status + ":" + t.trim().slice(0, 40)); });
     }).catch(function () { b.setAttribute("data-proxy", "error"); });
+    // v1.5: the app asks the page once for the sheet «لتصلك الإشعارات والتطبيق مقفل»; the page answers
+    addEventListener("sahm:closed-sheet", function () {
+      b.setAttribute("data-closed-sheet", "1");
+      if (window.SahmApp && window.SahmApp.closedSheetShown) window.SahmApp.closedSheetShown();
+    });
     if (window.SahmApp) {
       document.getElementById("p").textContent = "الإصدار " + window.SahmApp.version + " · الواجهة " + window.SahmApp.ui.version;
       window.SahmApp.ready();
