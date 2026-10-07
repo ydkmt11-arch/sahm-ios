@@ -95,7 +95,7 @@ case "$SCEN" in
     echo "[$SCEN] ydsahm:// opened the system prompt for the app" ;;
   real)           # the owner's copy on the live platform: interface downloaded from the PC, admin panel, then PC "off"
     install_variant "$APP_KEY"
-    xcrun simctl launch "$UDID" "$BID" -ciNoPrompt YES -ciReport YES -ciAdmin YES >/dev/null
+    xcrun simctl launch "$UDID" "$BID" -ciNoPrompt YES -ciReport YES -ciAdmin YES -ciWaitText M1 >/dev/null
     wait_stage home 180
     check "ci-$SCEN-home.json" "d['strategies'] and d['q1'] and d['m1'] and d['goal'] and not d['auth_error'] and not d['conn_error'] and d['bridge'] and not d['key_in_url'] and d['nav_buttons'] >= 5 and d['scheme'] == 'sahmui:' and not d['ui_builtin'] and len(d['ui_version']) == 12 and d['notify_bridge'] and d['notify_feed'].startswith('200:') and d['notify']['device_len'] == 32"
     sleep 6; shot real-1-home.png        # let a system banner (first-boot notices) clear first
@@ -105,7 +105,7 @@ case "$SCEN" in
     shot real-2-admin.png
     xcrun simctl terminate "$UDID" "$BID" >/dev/null 2>&1 || true
     rm -f "$(container)/Documents/ci.json" "$(container)/Documents/ci-next"
-    xcrun simctl launch "$UDID" "$BID" -ciNoPrompt YES -ciReport YES -ciForceOffline YES -ciStage offline >/dev/null
+    xcrun simctl launch "$UDID" "$BID" -ciNoPrompt YES -ciReport YES -ciForceOffline YES -ciStage offline -ciWaitText M1 >/dev/null
     wait_stage offline 90
     check "ci-$SCEN-offline.json" "d['offline'] and d['strategies'] and d['q1'] and d['m1'] and d['scheme'] == 'sahmui:'"
     sleep 2; shot real-3-offline.png ;;

@@ -44,6 +44,7 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
 
     private var ciReports = 0
     private var ciFirstReported = false
+    private var ciWaited = 0
     private var ciFirstDone = false
     private var ciPending: WebBundle.Root?
 
@@ -898,17 +899,41 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
         let first = ciReports == 1
         let stage = justUpdated ? "updated" : (UserDefaults.standard.string(forKey: "ciStage") ?? "home")
         DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
-            self?.ciProbe(stage: stage) {
-                guard let self = self else { return }
-                if !self.ciFirstDone {
-                    self.ciFirstDone = true
-                    if let pending = self.ciPending {
-                        self.ciPending = nil
-                        self.load(pending, updated: true)
-                        return
+            self?.ciWaitForText { [weak self] waited in
+                self?.ciWaited = waited
+                self?.ciProbe(stage: stage) {
+                    guard let self = self else { return }
+                    if !self.ciFirstDone {
+                        self.ciFirstDone = true
+                        if let pending = self.ciPending {
+                            self.ciPending = nil
+                            self.load(pending, updated: true)
+                            return
+                        }
                     }
+                    if first && stage == "home" { self.ciAwaitNext(attempt: 0) }
                 }
-                if first && stage == "home" { self.ciAwaitNext(attempt: 0) }
+            }
+        }
+    }
+
+    /// CI only (-ciWaitText <letters/digits>): the live platform can need more than 8 s to fill the home screen
+    /// (run 11 probed an empty home on a busy evening server), so the probe first waits for that text, at most
+    /// 60 s. Without the argument it returns at once.
+    private func ciWaitForText(attempt: Int = 0, then done: @escaping (Int) -> Void) {
+        let needle = (UserDefaults.standard.string(forKey: "ciWaitText") ?? "").filter { $0.isLetter || $0.isNumber }
+        if needle.isEmpty || attempt >= 60 {
+            done(attempt)
+            return
+        }
+        let js = "(document.body ? document.body.innerText : '').indexOf('" + needle + "') >= 0"
+        web.evaluateJavaScript(js) { [weak self] result, _ in
+            if let found = result as? Bool, found {
+                done(attempt)
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                self?.ciWaitForText(attempt: attempt + 1, then: done)
             }
         }
     }
@@ -916,6 +941,7 @@ final class MainViewController: UIViewController, WKNavigationDelegate, WKUIDele
     private func ciProbe(stage: String, then next: (() -> Void)? = nil) {
         web.evaluateJavaScript(MainViewController.probeJS) { [weak self] result, error in
             var report: [String: Any] = ["stage": stage]
+            report["ci_waited"] = self?.ciWaited ?? -1
             if let text = result as? String, let data = text.data(using: .utf8),
                let probe = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 report.merge(probe) { _, new in new }
